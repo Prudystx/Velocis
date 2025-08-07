@@ -7,10 +7,13 @@
 (define-constant ERR_NOT_FOUND (err u404))
 (define-constant ERR_INVALID_INPUT (err u400))
 (define-constant ERR_ALREADY_EXISTS (err u409))
+(define-constant ERR_INSUFFICIENT_FUNDS (err u402))
+(define-constant MIN_TIP_AMOUNT u1000000) ;; 1 STX in microSTX
 
 ;; Data Variables
 (define-data-var next-post-id uint u1)
 (define-data-var platform-fee uint u100) ;; 1% in basis points
+(define-data-var total-platform-earnings uint u0)
 
 ;; Data Maps
 (define-map posts 
@@ -20,6 +23,7 @@
     content: (string-ascii 280),
     timestamp: uint,
     likes: uint,
+    tips-received: uint,
     active: bool
   }
 )
@@ -32,6 +36,8 @@
     followers: uint,
     following: uint,
     posts-count: uint,
+    total-tips-received: uint,
+    total-tips-sent: uint,
     created-at: uint
   }
 )
@@ -51,6 +57,14 @@
   { post-id: uint }
 )
 
+(define-map post-tips
+  { post-id: uint, tipper: principal }
+  { 
+    amount: uint,
+    timestamp: uint
+  }
+)
+
 ;; Private Functions
 (define-private (is-valid-string (str (string-ascii 280)))
   (and (> (len str) u0) (<= (len str) u280))
@@ -62,6 +76,14 @@
 
 (define-private (is-valid-post-id (post-id uint))
   (and (> post-id u0) (< post-id (var-get next-post-id)))
+)
+
+(define-private (is-valid-tip-amount (amount uint))
+  (>= amount MIN_TIP_AMOUNT)
+)
+
+(define-private (calculate-platform-fee (amount uint))
+  (/ (* amount (var-get platform-fee)) u10000)
 )
 
 ;; Read-Only Functions
@@ -99,6 +121,21 @@
   (var-get platform-fee)
 )
 
+(define-read-only (get-total-platform-earnings)
+  (var-get total-platform-earnings)
+)
+
+(define-read-only (get-post-tip (post-id uint) (tipper principal))
+  (if (is-valid-post-id post-id)
+    (map-get? post-tips { post-id: post-id, tipper: tipper })
+    none
+  )
+)
+
+(define-read-only (get-min-tip-amount)
+  MIN_TIP_AMOUNT
+)
+
 ;; Public Functions
 (define-public (create-profile (username (string-ascii 50)) (bio (string-ascii 200)))
   (let (
@@ -115,6 +152,8 @@
         followers: u0,
         following: u0,
         posts-count: u0,
+        total-tips-received: u0,
+        total-tips-sent: u0,
         created-at: stacks-block-height
       }
     ))
@@ -135,6 +174,7 @@
         content: content,
         timestamp: stacks-block-height,
         likes: u0,
+        tips-received: u0,
         active: true
       }
     )
@@ -244,6 +284,63 @@
       (merge post { active: false })
     )
     (ok true)
+  )
+)
+
+(define-public (tip-post (post-id uint) (amount uint))
+  (let (
+    (post (unwrap! (get-post post-id) ERR_NOT_FOUND))
+    (author (get author post))
+    (tipper-profile (unwrap! (map-get? user-profiles { user: tx-sender }) ERR_NOT_FOUND))
+    (author-profile (unwrap! (map-get? user-profiles { user: author }) ERR_NOT_FOUND))
+    (platform-fee-amount (calculate-platform-fee amount))
+    (creator-amount (- amount platform-fee-amount))
+  )
+    (asserts! (is-valid-post-id post-id) ERR_INVALID_INPUT)
+    (asserts! (get active post) ERR_NOT_FOUND)
+    (asserts! (is-valid-tip-amount amount) ERR_INVALID_INPUT)
+    (asserts! (not (is-eq tx-sender author)) ERR_INVALID_INPUT)
+    
+    ;; Transfer STX from tipper to author
+    (try! (stx-transfer? creator-amount tx-sender author))
+    
+    ;; Transfer platform fee to contract owner
+    (if (> platform-fee-amount u0)
+      (begin
+        (try! (stx-transfer? platform-fee-amount tx-sender CONTRACT_OWNER))
+        (var-set total-platform-earnings (+ (var-get total-platform-earnings) platform-fee-amount))
+      )
+      true
+    )
+    
+    ;; Record the tip
+    (map-set post-tips 
+      { post-id: post-id, tipper: tx-sender }
+      {
+        amount: amount,
+        timestamp: stacks-block-height
+      }
+    )
+    
+    ;; Update post tips received
+    (map-set posts 
+      { post-id: post-id }
+      (merge post { tips-received: (+ (get tips-received post) amount) })
+    )
+    
+    ;; Update tipper profile
+    (map-set user-profiles 
+      { user: tx-sender }
+      (merge tipper-profile { total-tips-sent: (+ (get total-tips-sent tipper-profile) amount) })
+    )
+    
+    ;; Update author profile
+    (map-set user-profiles 
+      { user: author }
+      (merge author-profile { total-tips-received: (+ (get total-tips-received author-profile) creator-amount) })
+    )
+    
+    (ok { tip-amount: amount, creator-received: creator-amount, platform-fee: platform-fee-amount })
   )
 )
 
