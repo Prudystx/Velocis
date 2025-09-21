@@ -1,5 +1,5 @@
 ;; Velocis - Decentralized Social Media Platform
-;; A trustless social interaction platform built on Stacks
+;; A trustless social interaction platform built on Stacks with IPFS media support
 
 ;; Constants
 (define-constant CONTRACT_OWNER tx-sender)
@@ -9,6 +9,13 @@
 (define-constant ERR_ALREADY_EXISTS (err u409))
 (define-constant ERR_INSUFFICIENT_FUNDS (err u402))
 (define-constant MIN_TIP_AMOUNT u1000000) ;; 1 STX in microSTX
+
+;; Media type constants
+(define-constant MEDIA_TYPE_TEXT u0)
+(define-constant MEDIA_TYPE_IMAGE u1)
+(define-constant MEDIA_TYPE_VIDEO u2)
+(define-constant MEDIA_TYPE_AUDIO u3)
+(define-constant MEDIA_TYPE_DOCUMENT u4)
 
 ;; Data Variables
 (define-data-var next-post-id uint u1)
@@ -24,7 +31,10 @@
     timestamp: uint,
     likes: uint,
     tips-received: uint,
-    active: bool
+    active: bool,
+    media-type: uint,
+    ipfs-hash: (optional (string-ascii 100)),
+    media-metadata: (optional (string-ascii 200))
   }
 )
 
@@ -38,7 +48,8 @@
     posts-count: uint,
     total-tips-received: uint,
     total-tips-sent: uint,
-    created-at: uint
+    created-at: uint,
+    avatar-ipfs-hash: (optional (string-ascii 100))
   }
 )
 
@@ -65,6 +76,14 @@
   }
 )
 
+(define-map post-media-views
+  { post-id: uint }
+  { 
+    view-count: uint,
+    last-updated: uint
+  }
+)
+
 ;; Private Functions
 (define-private (is-valid-string (str (string-ascii 280)))
   (and (> (len str) u0) (<= (len str) u280))
@@ -80,6 +99,14 @@
 
 (define-private (is-valid-tip-amount (amount uint))
   (>= amount MIN_TIP_AMOUNT)
+)
+
+(define-private (is-valid-media-type (media-type uint))
+  (and (>= media-type MEDIA_TYPE_TEXT) (<= media-type MEDIA_TYPE_DOCUMENT))
+)
+
+(define-private (is-valid-ipfs-hash (ipfs-hash (string-ascii 100)))
+  (and (> (len ipfs-hash) u0) (<= (len ipfs-hash) u100))
 )
 
 (define-private (calculate-platform-fee (amount uint))
@@ -136,6 +163,23 @@
   MIN_TIP_AMOUNT
 )
 
+(define-read-only (get-post-media-views (post-id uint))
+  (if (is-valid-post-id post-id)
+    (map-get? post-media-views { post-id: post-id })
+    none
+  )
+)
+
+(define-read-only (get-media-type-constants)
+  {
+    text: MEDIA_TYPE_TEXT,
+    image: MEDIA_TYPE_IMAGE,
+    video: MEDIA_TYPE_VIDEO,
+    audio: MEDIA_TYPE_AUDIO,
+    document: MEDIA_TYPE_DOCUMENT
+  }
+)
+
 ;; Public Functions
 (define-public (create-profile (username (string-ascii 50)) (bio (string-ascii 200)))
   (let (
@@ -154,8 +198,21 @@
         posts-count: u0,
         total-tips-received: u0,
         total-tips-sent: u0,
-        created-at: stacks-block-height
+        created-at: stacks-block-height,
+        avatar-ipfs-hash: none
       }
+    ))
+  )
+)
+
+(define-public (update-profile-avatar (avatar-ipfs-hash (string-ascii 100)))
+  (let (
+    (user-profile (unwrap! (map-get? user-profiles { user: tx-sender }) ERR_NOT_FOUND))
+  )
+    (asserts! (is-valid-ipfs-hash avatar-ipfs-hash) ERR_INVALID_INPUT)
+    (ok (map-set user-profiles 
+      { user: tx-sender }
+      (merge user-profile { avatar-ipfs-hash: (some avatar-ipfs-hash) })
     ))
   )
 )
@@ -175,7 +232,10 @@
         timestamp: stacks-block-height,
         likes: u0,
         tips-received: u0,
-        active: true
+        active: true,
+        media-type: MEDIA_TYPE_TEXT,
+        ipfs-hash: none,
+        media-metadata: none
       }
     )
     (map-set user-posts 
@@ -188,6 +248,77 @@
     )
     (var-set next-post-id (+ post-id u1))
     (ok post-id)
+  )
+)
+
+(define-public (create-media-post 
+  (content (string-ascii 280)) 
+  (media-type uint) 
+  (ipfs-hash (string-ascii 100)) 
+  (media-metadata (optional (string-ascii 200))))
+  (let (
+    (post-id (var-get next-post-id))
+    (user-profile (unwrap! (map-get? user-profiles { user: tx-sender }) ERR_NOT_FOUND))
+    (current-posts-count (get posts-count user-profile))
+  )
+    (asserts! (is-valid-string content) ERR_INVALID_INPUT)
+    (asserts! (is-valid-media-type media-type) ERR_INVALID_INPUT)
+    (asserts! (is-valid-ipfs-hash ipfs-hash) ERR_INVALID_INPUT)
+    (asserts! (if (is-some media-metadata)
+      (<= (len (unwrap-panic media-metadata)) u200)
+      true) ERR_INVALID_INPUT)
+    
+    (map-set posts 
+      { post-id: post-id }
+      {
+        author: tx-sender,
+        content: content,
+        timestamp: stacks-block-height,
+        likes: u0,
+        tips-received: u0,
+        active: true,
+        media-type: media-type,
+        ipfs-hash: (some ipfs-hash),
+        media-metadata: media-metadata
+      }
+    )
+    (map-set user-posts 
+      { user: tx-sender, post-index: current-posts-count }
+      { post-id: post-id }
+    )
+    (map-set user-profiles 
+      { user: tx-sender }
+      (merge user-profile { posts-count: (+ current-posts-count u1) })
+    )
+    (map-set post-media-views
+      { post-id: post-id }
+      {
+        view-count: u0,
+        last-updated: stacks-block-height
+      }
+    )
+    (var-set next-post-id (+ post-id u1))
+    (ok post-id)
+  )
+)
+
+(define-public (increment-media-view (post-id uint))
+  (let (
+    (post (unwrap! (get-post post-id) ERR_NOT_FOUND))
+    (media-views (default-to { view-count: u0, last-updated: u0 } 
+                              (get-post-media-views post-id)))
+  )
+    (asserts! (is-valid-post-id post-id) ERR_INVALID_INPUT)
+    (asserts! (get active post) ERR_NOT_FOUND)
+    (asserts! (> (get media-type post) MEDIA_TYPE_TEXT) ERR_INVALID_INPUT)
+    
+    (ok (map-set post-media-views
+      { post-id: post-id }
+      {
+        view-count: (+ (get view-count media-views) u1),
+        last-updated: stacks-block-height
+      }
+    ))
   )
 )
 
